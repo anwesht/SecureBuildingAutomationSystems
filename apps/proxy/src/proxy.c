@@ -40,9 +40,13 @@ enum {
 /*------------------------------------------------------------------------------
     VARIABLES
 ------------------------------------------------------------------------------*/
+/* at: static global variable assigned as a stack for each worker thread.
+ * This resides in the data region and is allocated for this process by the elf loader.
+ */
 static uint64_t thread_stacks[CONFIG_APP_PROXY_MAX_NUM_CLIENTS][THREAD_STACK_SIZE];
 
-static proxy_config_t *config = (proxy_config_t*)CONFIG_ADDRESS; 
+/* at: The config "passed" to this process by the sos process by writing to CONFIG_ADDRESS */
+static proxy_config_t *config = (proxy_config_t*)CONFIG_ADDRESS;
 
 keyInstance key_e[CONFIG_APP_PROXY_MAX_NUM_CLIENTS];
 keyInstance key_d[CONFIG_APP_PROXY_MAX_NUM_CLIENTS];
@@ -86,32 +90,33 @@ void worker_thread(void) {
                 len = MIN(sizeof(recieved_data), (seL4_MessageInfo_get_length(tag) - 1)*sizeof(seL4_Word));
 
                 //printf("PROXY: sending packet, len=%i\n", len);
-        
+
                 if(config->enable_encryption) {//TODO pack length
-                    
                     len = (len % 16 > 0) ? (len/16 + 1)*16 : len; /* normalize to block len */
+
+                    /* at: calculate hash for verification after decryption */
                     MD5_CTX hash_ctx;
                     MD5_Init(&hash_ctx);
                     MD5_Update(&hash_ctx, (void *)(seL4_GetIPCBuffer()->msg + 1), len);
                     MD5_Final(hashed_data, &hash_ctx);
 
+                    /* at: Write hash to buffer */
                     memcpy(hashed_data+16, seL4_GetIPCBuffer()->msg + 1, len);
                     len += 16; /* add hash size */
 
-                    
                     printf("PROXY: Hash=%x%x%x%x len=%i\n",
                                    ((int *)hashed_data)[0],
                                    ((int *)hashed_data)[1],
                                    ((int *)hashed_data)[2],
                                    ((int *)hashed_data)[3], len);
-
+                    /* at: encrypt the data (including hash of the data) */
                     len = blockEncrypt(
                             &cipher_e[id],
                             &key_e[id],
                             hashed_data,
                             MAX(128, len*8), /* at least 1 block (128 bits) must be used, sizes in bits */
                             recieved_data)/8; /* Offset by 16 bytes for hash */
-                    
+
                     if(len == 0) {
                         printf("PROXY: encrpytion failed.\n");
                         seL4_Reply(tag);
@@ -120,7 +125,7 @@ void worker_thread(void) {
                 } else {
                     memcpy(recieved_data, seL4_GetIPCBuffer()->msg + 1, len);
                 }
-        
+
                 send_packet(ip_address, port, recieved_data, len);
                 seL4_Reply(tag);
                 break;
@@ -129,8 +134,9 @@ void worker_thread(void) {
                     len = recv_packet(port, recieved_data, sizeof(recieved_data), &remote_ip_address);
 
                     //printf("PROXY: recieved packet, len=%i\n", len);
-        
+
                     if(config->enable_encryption) {
+                      /* at: Decrypt the data. */
                         len = blockDecrypt(
                                 &cipher_d[id],
                                 &key_d[id],
@@ -144,17 +150,17 @@ void worker_thread(void) {
                         }
 
                         printf("PROXY: len=%i\n", len);
-
+                        /* at: recalculate the hash for verification */
                         len -= 16;
                         MD5_CTX hash_ctx;
                         MD5_Init(&hash_ctx);
                         MD5_Update(&hash_ctx, (void *)(hashed_data+16), len);
                         MD5_Final(recieved_data, &hash_ctx); /* use a a temp storage place */
-                        
+
 
                         if(recieved_data[0] != hashed_data[0] ||
-                           recieved_data[1] != hashed_data[1] ||     
-                           recieved_data[2] != hashed_data[2] ||     
+                           recieved_data[1] != hashed_data[1] ||
+                           recieved_data[2] != hashed_data[2] ||
                            recieved_data[3] != hashed_data[3])
                         {
                             printf("PROXY: HASH COMPARISON FAILED. %x%x%x%x != %x%x%x%x\n",
@@ -168,12 +174,12 @@ void worker_thread(void) {
                                    ((int*)hashed_data)[3]);
                             continue;
                         }
-                        memcpy(seL4_GetIPCBuffer()->msg, hashed_data+16, len);      
+                        memcpy(seL4_GetIPCBuffer()->msg, hashed_data+16, len);
 
                     } else {
                         memcpy(seL4_GetIPCBuffer()->msg, recieved_data, len);
                     }
-        
+
                     tag = seL4_MessageInfo_new(0, 0, 0, len); //TODO check for correct size (word size)??
                     seL4_SetTag(tag);
                     seL4_Reply(tag);
@@ -200,28 +206,31 @@ int main(void) {
 
     for(int i = 0; i < config->num_clients; i++) {
         if(config->enable_encryption) {
-    
+            /*------------------------------------------------------------------------------
+                Setup encryption library
+            ------------------------------------------------------------------------------*/
             err = makeKey(&key_e[i], DIR_ENCRYPT, 256, config->clients[i].psk);
             if(err < 0) {
                 printf("makeKey e error: %i\n", err);
             }
-        
+
             err = makeKey(&key_d[i], DIR_DECRYPT, 256, config->clients[i].psk);
             if(err < 0) {
                 printf("makeKey d error: %i\n", err);
             }
-        
+
             err = cipherInit(&cipher_e[i], MODE_ECB, config->clients[i].iv);
             if(err < 0) {
                 printf("cipherInit e error: %i\n", err);
             }
-        
+
             err = cipherInit(&cipher_d[i], MODE_ECB, config->clients[i].iv);
             if(err < 0) {
                 printf("cipherInit d error: %i\n", err);
             }
         }
 
+        /* at: Setup TCB for each worker thread. */
         uintptr_t thread_stack_top = (uintptr_t)thread_stacks[i] + sizeof(thread_stacks[i]);
 
         seL4_UserContext regs = {0};
@@ -232,7 +241,7 @@ int main(void) {
         seL4_Yield();
     }
 
-
+    /* at: Yield (to worker threads) */
     while(1) seL4_Yield();
 
     return 0;
